@@ -483,6 +483,34 @@ def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    x_max = tl.full([B0], -float("inf"),dtype=tl.float32)
+    new_x_max = tl.full([B0], -float("inf"),dtype=tl.float32)
+
+    for id_j in tl.range(0, T, B1):
+        off_j = id_j + tl.arange(0, B1)
+        mask_j = off_j < T
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + off_ij, mask_ij)
+        new_x_max = tl.maximum(x_max, tl.max(x, axis=1))
+        new_exp_x = tl.exp2(log2_e * (x - new_x_max[:, None]))
+        scale = tl.exp2(log2_e * (x_max - new_x_max))
+        exp_sum_now = tl.sum(new_exp_x, axis=1)
+        exp_sum = exp_sum * scale + exp_sum_now
+        x_max = new_x_max
+    for id_j in tl.range(0, T, B1):
+        off_j = id_j + tl.arange(0, B1)
+        mask_j = off_j < T
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + off_ij, mask_ij)
+        norm_x = x - x_max[:, None]
+        exp_x = tl.exp2(log2_e * norm_x)
+        z = exp_x / exp_sum[:, None]
+        tl.store(z_ptr + off_ij, z, mask_ij)
     return
 
 
@@ -568,6 +596,31 @@ def flashatt_kernel(
     log2_e = 1.44269504
     myexp = lambda x: tl.exp2(log2_e * x)
     # Finish me!
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+    q = tl.load(q_ptr + off_i, mask_i)
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    qk_max = tl.full([B0], -float("inf"),dtype=tl.float32)
+    z = tl.zeros([B0], dtype=tl.float32)
+    for id_j in tl.range(0, T, B1):
+        off_j = id_j + tl.arange(0, B1)
+        mask_j = off_j < T
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+
+        k = tl.load(k_ptr + off_j, mask_j)
+        qk = q[:, None] * k[None, :] + tl.where(mask_ij, 0, -1.0e6) # 无效值设置为 -1.0e6，掩码
+        new_qk_max = tl.maximum(qk_max, tl.max(qk, axis=1))
+        new_exp_qk = myexp(qk - new_qk_max[:, None])
+        scale = myexp(qk_max - new_qk_max)
+        exp_sum_now = tl.sum(new_exp_qk, axis=1)
+        exp_sum = exp_sum * scale + exp_sum_now
+        qk_max = new_qk_max
+
+        v = tl.load(v_ptr + off_j, mask_j)
+        z = z * scale + tl.sum(new_exp_qk * v[None, :], axis=1)
+    z = z / exp_sum
+    tl.store(z_ptr + off_i, z, mask_i)
     return
 
 
@@ -601,6 +654,23 @@ def conv2d_kernel(
 ):
     block_id_i = tl.program_id(0)
     # Finish me!
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+    off_h = tl.arange(0, KH)
+    off_w = tl.arange(0, KW)
+    off_hw = off_h[:, None] * KW + off_w[None, :]
+    k = tl.load(k_ptr+off_hw)
+
+    for j in tl.range(0,H):
+        for l in tl.range(0,W):
+            off_j_oj = j + off_h[None, :, None]
+            off_l_ol = l + off_w[None, None, :]
+            off_x = off_i * H * W + off_j_oj * W + off_l_ol
+            mask_x = (off_j_oj < H) & (off_l_ol < W)
+            x = tl.load(x_ptr + off_x, mask_x)
+            z = tl.sum(x * k[None, :])
+            off_z = off_i * H * W + j * W + l
+            tl.store(z_ptr + off_z, z)
     return
 
 
@@ -647,6 +717,28 @@ def dot_kernel(
     block_id_k = tl.program_id(1)
     block_id_i = tl.program_id(2)
     # Finish me!
+    off_i = block_id_i * B2 + tl.arange(0, B2)
+    off_j = block_id_j * B0 + tl.arange(0, B0)
+    off_k = block_id_k * B1 + tl.arange(0, B1)
+    mask_i = off_i < N2
+    mask_j = off_j < N0
+    mask_k = off_k < N1
+    z = tl.zeros((B2,B0,B1),dtype=tl.float32)
+    off_z = off_i[:, None, None] * N0 * N1 + off_j[None, :, None] * N1 + off_k[None, None, :]
+    mask_z = mask_i[:, None, None] & mask_j[None, :, None] & mask_k[None, None, :]
+
+    for l in tl.range(0, MID, B_MID):
+        off_l = l + tl.arange(0, B_MID)
+        mask_l = off_l < MID
+        off_x = off_i[:, None, None] * N0 * MID + off_j[None, :, None] * MID + off_l[None, None, :]
+        off_y = off_i[:, None, None] * MID * N1 + off_l[None, :, None] * N1 + off_k[None, None, :]
+        mask_x = mask_i[:, None, None] & mask_j[None, :, None] & mask_l[None, None, :]
+        mask_y = mask_i[:, None, None] & mask_l[None, :, None] & mask_k[None, None, :]
+        x = tl.load(x_ptr + off_x, mask_x)
+        y = tl.load(y_ptr + off_y, mask_y)
+        z += tl.dot(x,y)
+    tl.store(z_ptr + off_z, z, mask_z)
+
     return
 
 
@@ -713,6 +805,48 @@ def quant_dot_kernel(
     block_id_j = tl.program_id(0)
     block_id_k = tl.program_id(1)
     # Finish me!
+    off_j = block_id_j * B0 + tl.arange(0, B0)
+    off_k = block_id_k * B1 + tl.arange(0, B1)
+    mask_j = off_j < N0
+    mask_k = off_k < N1
+    z = tl.zeros((B0,B1),dtype=tl.float32)
+    off_z = off_j[:, None] * N1 + off_k[None, :]
+    mask_z = mask_j[:, None] & mask_k[None, :]
+
+    for l in tl.range(0, MID, B_MID):
+        off_l_div_g = tl.arange(0, B_MID//GROUP) + (l // GROUP)
+        mask_l_div_g = off_l_div_g < MID // GROUP
+        off_scale = off_j[:, None] * (MID // GROUP) + off_l_div_g[None, :]
+        mask_scale = mask_j[:, None] & mask_l_div_g[None, :]
+        scale = tl.load(scale_ptr + off_scale, mask_scale)
+
+        shift = tl.load(offset_ptr + off_j, mask_j)
+
+        off_weight_l = l + tl.arange(0, B_MID//FPINT)
+        mask_weight_l = off_weight_l < (MID // FPINT)
+        off_weight = off_j[:, None] * (MID // FPINT) + off_weight_l[None, :]
+        mask_weight = mask_j[:, None] & mask_weight_l[None, :]
+        weight = tl.load(weight_ptr + off_weight, mask_weight)
+
+        off_l = l + tl.arange(0, B_MID)
+        mask_l = off_l < MID
+        off_activation = off_l[:, None] * N1 + off_k[None, :]
+        mask_activation = mask_l[:, None] & mask_k[None,:]
+        activation = tl.load(activation_ptr + off_activation, mask_activation)
+
+        BITS = 32 // FPINT
+        unpack_offs = tl.arange(0, FPINT) * BITS # 每个量化元素在32位整数中的偏移
+        unpack_upperbound_mask = (1<<BITS) - 1 # 4位整数的上界
+        unpacked_shift = (shift[:,None] >> unpack_offs) & unpack_upperbound_mask
+        unpacked_weight = (weight[:,:,None] >> unpack_offs) & unpack_upperbound_mask
+
+        transformed_weight = scale[:,:,None] * (
+            unpacked_weight - unpacked_shift[:,:,None]
+        )
+        transformed_weight = transformed_weight.reshape(unpacked_shift.shape[0], unpacked_shift.shape[-1]*FPINT)
+        z += tl.dot(transformed_weight, activation)
+    tl.store(z_ptr + off_z, z, mask_z)
+
     return
 
 
