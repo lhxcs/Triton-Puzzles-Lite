@@ -58,16 +58,16 @@ tl.load use mask: [0 1 2 3 4 5 6 7] < 5 = [1 1 1 1 1 0 0 0]
 
 @triton.jit
 def demo1(x_ptr):
-    range = tl.arange(0, 8)
+    range = tl.arange(0, 8) # 生成一个从 0 到 7 的序列
     # print works in the interpreter
     print(range)
-    x = tl.load(x_ptr + range, range < 5, 0)
+    x = tl.load(x_ptr + range, range < 5, 0) # 从内存地址 x_ptr + range 加载数据，mask 为 range < 5
     print(x)
 
 
 def run_demo1():
     print("Demo1 Output: ")
-    demo1[(1, 1, 1)](torch.ones(4, 3))
+    demo1[(1, 1, 1)](torch.ones(4, 3)) # [(1,1,1)] 是 triton 的启动配置，启动一个 block, 每个 block 有一个线程, 1 个维度
     print_end_line()
 
 
@@ -103,9 +103,9 @@ tl.load use mask: i < 4 and j < 3.
 
 @triton.jit
 def demo2(x_ptr):
-    i_range = tl.arange(0, 8)[:, None]
-    j_range = tl.arange(0, 4)[None, :]
-    range = i_range * 4 + j_range
+    i_range = tl.arange(0, 8)[:, None] # 生成一个从 0 到 7 的序列，然后增加一个维度，变成 8x1 的矩阵
+    j_range = tl.arange(0, 4)[None, :] # 生成一个从 0 到 3 的序列，然后增加一个维度，变成 1x4 的矩阵
+    range = i_range * 4 + j_range 
     # print works in the interpreter
     print(range)
     x = tl.load(x_ptr + range, (i_range < 4) & (j_range < 3), 0)
@@ -181,8 +181,8 @@ use pointer (i.e. continuous in memory).
 
 @triton.jit
 def demo4(x_ptr):
-    pid = tl.program_id(0)
-    range = tl.arange(0, 8) + pid * 8
+    pid = tl.program_id(0) # 获取当前 block 的 id
+    range = tl.arange(0, 8) + pid * 8 # 生成一个从 0 到 7 的序列，然后加上 block id * 8
     x = tl.load(x_ptr + range, range < 20)
     print("Print for each", pid, x)
 
@@ -216,6 +216,8 @@ def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     off_x = tl.arange(0, B0)
     x = tl.load(x_ptr + off_x)
     # Finish me!
+    x = x + 10.0
+    tl.store(z_ptr + off_x, x)
     return
 
 
@@ -237,6 +239,11 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # Finish me!
+    block_id = tl.program_id(0) # 获取当前 block 的 id，从 0 开始
+    off_x = block_id * B0 + tl.arange(0, B0)
+    x = tl.load(x_ptr + off_x, off_x < N0)
+    x = x + 10.0
+    tl.store(z_ptr + off_x, x, off_x < N0)
     return
 
 
@@ -260,6 +267,14 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    x_range = tl.arange(0, B0)
+    y_range = tl.arange(0, B1)
+    x = tl.load(x_ptr + x_range)
+    y = tl.load(y_ptr + y_range)
+    z = x[None, :] + y[:, None]
+    off_x = x_range[None, :]
+    off_y = y_range[:, None]
+    tl.store(z_ptr + off_y * N0 + off_x, z)
     return
 
 
@@ -286,6 +301,16 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
+    off_x = block_id_x * B0 + tl.arange(0, B0)
+    off_y = block_id_y * B1 + tl.arange(0, B1)
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    x = tl.load(x_ptr + off_x, mask_x)
+    y = tl.load(y_ptr + off_y, mask_y)
+    z = x[None, :] + y[:, None]
+    off_xz = off_x[None, :]
+    off_yz = off_y[:, None]
+    tl.store(z_ptr + off_yz * N0 + off_xz, z, mask_x[None, :] & mask_y[:, None])
     # Finish me!
     return
 
@@ -313,6 +338,17 @@ def mul_relu_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
+    off_x = block_id_x * B0 + tl.arange(0, B0)
+    off_y = block_id_y * B1 + tl.arange(0, B1)
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    x = tl.load(x_ptr + off_x, mask_x)
+    y = tl.load(y_ptr + off_y, mask_y)
+    off_z = off_y[:, None] * N0 + off_x[None, :]
+    mask_z = mask_x[None, :] & mask_y[:, None]
+    z = x[None, :] * y[:, None]
+    z = tl.where(z > 0, z, 0.0) # where: if z > 0, z, else 0.0
+    tl.store(z_ptr + off_z, z, mask_z)
     # Finish me!
     return
 
@@ -353,6 +389,21 @@ def mul_relu_block_back_kernel(
 ):
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
+    off_x = block_id_i * B0 + tl.arange(0, B0)
+    off_y = block_id_j * B1 + tl.arange(0, B1)
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    off_xy = off_y[:, None] * N0 + off_x[None, :]
+    mask_xy = mask_x[None, :] & mask_y[:, None]
+    x = tl.load(x_ptr + off_xy, mask_xy)
+    y = tl.load(y_ptr + off_y, mask_y)
+    dz = tl.load(dz_ptr + off_xy, mask_xy)
+
+    relu = tl.where(x * y[:, None] > 0, 1.0, 0.0)
+    dx = y[:, None]
+    dx = relu * dx * dz
+    tl.store(dx_ptr + off_xy, dx, mask_xy)
+
     # Finish me!
     return
 
@@ -379,6 +430,18 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    block_id_i = tl.program_id(0)
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+    z = tl.zeros([B0], dtype=tl.float32)
+    for id_j in tl.range(0, T, B1):
+        off_j = id_j + tl.arange(0, B1)
+        mask_j = off_j < T
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + off_ij, mask_ij)
+        z += tl.sum(x, axis=1)
+    tl.store(z_ptr + off_i, z, mask_i)
     return
 
 
@@ -431,6 +494,42 @@ def softmax_kernel_brute_force(
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    x_max = tl.zeros([B0], dtype=tl.float32)
+
+    # 第一个循环，计算 max
+    for id_j in tl.range(0, T, B1):
+        off_j = id_j + tl.arange(0, B1)
+        mask_j = off_j < T
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + off_ij, mask_ij)
+        x_max = tl.maximum(x_max, tl.max(x, axis=1))
+
+    # 第二个循环，计算 exp_sum
+    for id_j in tl.range(0, T, B1):
+        off_j = id_j + tl.arange(0, B1)
+        mask_j = off_j < T
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + off_ij, mask_ij)
+        norm_x = x - x_max[:, None]
+        exp_x = tl.exp2(log2_e * norm_x)
+        exp_sum += tl.sum(exp_x, axis=1)
+    
+    # 第三个循环，计算 softmax
+    for id_j in tl.range(0, T, B1):
+        off_j = id_j + tl.arange(0, B1)
+        mask_j = off_j < T
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + off_ij, mask_ij)
+        norm_x = x - x_max[:, None]
+        exp_x = tl.exp2(log2_e * norm_x)
+        z = exp_x / exp_sum[:, None]
+        tl.store(z_ptr + off_ij, z, mask_ij)
     return
 
 
